@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/created-by: perses-operator
     app.kubernetes.io/name: perses-operator
     app.kubernetes.io/part-of: perses-operator
-    app.kubernetes.io/version: v0.2.0
+    app.kubernetes.io/version: v0.3.2
   name: perses-operator
 rules:
 - apiGroups:
@@ -33,6 +33,14 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - services
   - configmaps
   - secrets
@@ -42,6 +50,14 @@ rules:
   - update
   - create
   - delete
+  - list
+  - watch
+- apiGroups:
+  - config.openshift.io
+  resources:
+  - apiservers
+  verbs:
+  - get
   - list
   - watch
 - apiGroups:

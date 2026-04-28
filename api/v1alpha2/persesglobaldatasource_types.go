@@ -1,18 +1,15 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package v1alpha2
 
@@ -22,8 +19,13 @@ import (
 
 // PersesGlobalDatasourceStatus defines the observed state of PersesGlobalDatasource
 type PersesGlobalDatasourceStatus struct {
+	// conditions represent the latest observations of the PersesGlobalDatasource resource state
 	// +operator-sdk:csv:customresourcedefinitions:type=status
-	// Conditions represent the latest observations of the PersesGlobalDatasource resource state
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 }
 
@@ -36,10 +38,17 @@ type PersesGlobalDatasourceStatus struct {
 
 // PersesGlobalDatasource is the Schema for the PersesGlobalDatasources API
 type PersesGlobalDatasource struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
+	// metadata is the standard Kubernetes ObjectMeta
+	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   DatasourceSpec               `json:"spec,omitempty"`
+	// spec is the desired state of the PersesGlobalDatasource resource
+	// +required
+	Spec DatasourceSpec `json:"spec,omitzero"`
+	// status is the observed state of the PersesGlobalDatasource resource
+	// +optional
+	//nolint:kubeapilinter // non-pointer Status is the standard pattern for Kubernetes controllers
 	Status PersesGlobalDatasourceStatus `json:"status,omitempty"`
 }
 

@@ -3,7 +3,7 @@
   https://github.com/perses/perses-operator/blob/main/CONTRIBUTING.md
 -->
 
-## Description
+# Description
 
 <!-- Describe the big picture of your changes here to communicate to the maintainers why we should accept this pull request. -->
 
@@ -26,6 +26,7 @@ Closes: #ISSUE-NUMBER
 
 - [ ] Unit tests added/updated
 - [ ] Integration tests added/updated
+- [ ] E2E tests added/updated
 - [ ] Manual testing performed
 
 ## Checklist

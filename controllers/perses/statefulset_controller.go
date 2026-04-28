@@ -1,18 +1,15 @@
-/*
-Copyright 2025 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package perses
 
@@ -47,13 +44,13 @@ func (r *PersesReconciler) reconcileStatefulSet(ctx context.Context, req ctrl.Re
 		return subreconciler.RequeueWithError(fmt.Errorf("perses not found in context"))
 	}
 
-	if perses.Spec.Config.Database.File == nil {
-		stlog.Debug("Database file configuration is not set, skipping StatefulSet creation")
+	if !perses.RequiresStatefulSet() {
+		stlog.Debug("File database not configured or EmptyDir storage configured, skipping StatefulSet creation")
 
 		found := &appsv1.StatefulSet{}
 		err := r.Get(ctx, types.NamespacedName{Name: perses.Name, Namespace: perses.Namespace}, found)
 		if err == nil {
-			stlog.Info("Deleting StatefulSet since database configuration changed")
+			stlog.Info("Deleting StatefulSet since configuration changed")
 			if err := r.Delete(ctx, found); err != nil {
 				stlog.WithError(err).Error("Failed to delete StatefulSet")
 				return subreconciler.RequeueWithError(err)
@@ -123,9 +120,17 @@ func (r *PersesReconciler) createPersesStatefulSet(
 
 	ls := common.LabelsForPerses(perses.Name, perses)
 
-	annotations := map[string]string{}
+	annotations := make(map[string]string)
 	if perses.Spec.Metadata != nil && perses.Spec.Metadata.Annotations != nil {
 		annotations = perses.Spec.Metadata.Annotations
+	}
+
+	provisioningHash, err := common.GetProvisioningHash(perses)
+	if err != nil {
+		return nil, err
+	}
+	if provisioningHash != "" {
+		annotations[common.PersesProvisioningVersion] = provisioningHash
 	}
 
 	// Get the Operand image
@@ -171,11 +176,16 @@ func (r *PersesReconciler) createPersesStatefulSet(
 							},
 						},
 						Ports: []corev1.ContainerPort{{
-							ContainerPort: perses.Spec.ContainerPort,
-							Name:          "perses",
+							ContainerPort: func() int32 {
+								if perses.Spec.ContainerPort != nil {
+									return *perses.Spec.ContainerPort
+								}
+								return common.DefaultContainerPort
+							}(),
+							Name: "perses",
 						}},
 						VolumeMounts:   common.GetVolumeMounts(perses),
-						Args:           common.GetPersesArgs(perses),
+						Args:           common.GetPersesArgs(perses, r.Config.TLSMinVersion, r.Config.TLSCipherSuites, r.Config.TLSConfigureOperands),
 						LivenessProbe:  livenessProbe,
 						ReadinessProbe: readinessProbe,
 					}},
@@ -208,20 +218,22 @@ func (r *PersesReconciler) createPersesStatefulSet(
 		sts.Spec.Template.Spec.Containers[0].Resources = *perses.Spec.Resources
 	}
 
-	if perses.Spec.Storage != nil {
-		if perses.Spec.Storage.StorageClass != nil && len(*perses.Spec.Storage.StorageClass) > 0 {
-			sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = perses.Spec.Storage.StorageClass
-		}
+	if perses.Spec.Storage != nil && perses.Spec.Storage.PersistentVolumeClaimTemplate != nil {
+		pvcTemplate := perses.Spec.Storage.PersistentVolumeClaimTemplate
 
-		if !perses.Spec.Storage.Size.IsZero() {
-			sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests = corev1.ResourceList{
-				corev1.ResourceStorage: perses.Spec.Storage.Size,
+		// Apply user-provided PVC template spec
+		sts.Spec.VolumeClaimTemplates[0].Spec = *pvcTemplate
+
+		// Set default AccessModes if not specified
+		if pvcTemplate.AccessModes == nil {
+			sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes = []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
 			}
 		}
 	}
 
-	if perses.Spec.ServiceAccountName != "" {
-		sts.Spec.Template.Spec.ServiceAccountName = perses.Spec.ServiceAccountName
+	if perses.Spec.ServiceAccountName != nil && *perses.Spec.ServiceAccountName != "" {
+		sts.Spec.Template.Spec.ServiceAccountName = *perses.Spec.ServiceAccountName
 	}
 
 	// Set the ownerRef for the StatefulSet

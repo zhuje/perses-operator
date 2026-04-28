@@ -1,3 +1,16 @@
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package common
 
 import (
@@ -19,7 +32,7 @@ import (
 const tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 type PersesClientFactory interface {
-	CreateClient(ctx context.Context, client client.Client, perses persesv1alpha2.Perses) (v1.ClientInterface, error)
+	CreateClient(ctx context.Context, client client.Reader, perses persesv1alpha2.Perses) (v1.ClientInterface, error)
 }
 
 type PersesClientFactoryWithConfig struct{}
@@ -28,7 +41,7 @@ func NewWithConfig() PersesClientFactory {
 	return &PersesClientFactoryWithConfig{}
 }
 
-func (f *PersesClientFactoryWithConfig) CreateClient(ctx context.Context, client client.Client, perses persesv1alpha2.Perses) (v1.ClientInterface, error) {
+func (f *PersesClientFactoryWithConfig) CreateClient(ctx context.Context, client client.Reader, perses persesv1alpha2.Perses) (v1.ClientInterface, error) {
 	var urlStr string
 
 	var httpProtocol = "http"
@@ -40,7 +53,11 @@ func (f *PersesClientFactoryWithConfig) CreateClient(ctx context.Context, client
 	if serverURLFlag != nil && serverURLFlag.Value.String() != "" {
 		urlStr = serverURLFlag.Value.String()
 	} else {
-		urlStr = fmt.Sprintf("%s://%s.%s.svc.cluster.local:%d", httpProtocol, perses.Name, perses.Namespace, perses.Spec.ContainerPort)
+		containerPort := DefaultContainerPort
+		if perses.Spec.ContainerPort != nil {
+			containerPort = *perses.Spec.ContainerPort
+		}
+		urlStr = fmt.Sprintf("%s://%s.%s.svc.cluster.local:%d%s", httpProtocol, perses.Name, perses.Namespace, containerPort, perses.Spec.Config.APIPrefix)
 	}
 	parsedURL, err := common.ParseURL(urlStr)
 	if err != nil {
@@ -70,8 +87,13 @@ func (f *PersesClientFactoryWithConfig) CreateClient(ctx context.Context, client
 	if isClientTLSEnabled(&perses) {
 		tls := perses.Spec.Client.TLS
 
+		insecureSkipVerify := false
+		if tls.InsecureSkipVerify != nil {
+			insecureSkipVerify = *tls.InsecureSkipVerify
+		}
+
 		tlsConfig := &secret.TLSConfig{
-			InsecureSkipVerify: tls.InsecureSkipVerify,
+			InsecureSkipVerify: insecureSkipVerify,
 		}
 
 		if tls.CaCert != nil {
@@ -126,6 +148,6 @@ func NewWithClient(client v1.ClientInterface) PersesClientFactory {
 	return &PersesClientFactoryWithClient{client: client}
 }
 
-func (f *PersesClientFactoryWithClient) CreateClient(_ context.Context, _ client.Client, _ persesv1alpha2.Perses) (v1.ClientInterface, error) {
+func (f *PersesClientFactoryWithClient) CreateClient(_ context.Context, _ client.Reader, _ persesv1alpha2.Perses) (v1.ClientInterface, error) {
 	return f.client, nil
 }

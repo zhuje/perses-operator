@@ -1,18 +1,15 @@
-/*
-Copyright 2023 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package perses
 
@@ -46,13 +43,13 @@ func (r *PersesReconciler) reconcileDeployment(ctx context.Context, req ctrl.Req
 		return subreconciler.RequeueWithError(fmt.Errorf("perses not found in context"))
 	}
 
-	if perses.Spec.Config.Database.SQL == nil {
-		dlog.Debug("Database SQL configuration is not set, skipping Deployment creation")
+	if !perses.RequiresDeployment() {
+		dlog.Debug("Neither SQL database nor file database with EmptyDir configured, skipping Deployment creation")
 
 		found := &appsv1.Deployment{}
 		err := r.Get(ctx, types.NamespacedName{Name: perses.Name, Namespace: perses.Namespace}, found)
 		if err == nil {
-			dlog.Info("Deleting Deployment since database configuration changed")
+			dlog.Info("Deleting Deployment since configuration changed")
 			if err := r.Delete(ctx, found); err != nil {
 				dlog.WithError(err).Error("Failed to delete Deployment")
 				return subreconciler.RequeueWithError(err)
@@ -121,9 +118,17 @@ func (r *PersesReconciler) createPersesDeployment(
 
 	ls := common.LabelsForPerses(perses.Name, perses)
 
-	annotations := map[string]string{}
+	annotations := make(map[string]string)
 	if perses.Spec.Metadata != nil && perses.Spec.Metadata.Annotations != nil {
 		annotations = perses.Spec.Metadata.Annotations
+	}
+
+	provisioningHash, err := common.GetProvisioningHash(perses)
+	if err != nil {
+		return nil, err
+	}
+	if provisioningHash != "" {
+		annotations[common.PersesProvisioningVersion] = provisioningHash
 	}
 
 	// Get the Operand image
@@ -169,11 +174,16 @@ func (r *PersesReconciler) createPersesDeployment(
 							},
 						},
 						Ports: []corev1.ContainerPort{{
-							ContainerPort: perses.Spec.ContainerPort,
-							Name:          "perses",
+							ContainerPort: func() int32 {
+								if perses.Spec.ContainerPort != nil {
+									return *perses.Spec.ContainerPort
+								}
+								return common.DefaultContainerPort
+							}(),
+							Name: "perses",
 						}},
 						VolumeMounts:   common.GetVolumeMounts(perses),
-						Args:           common.GetPersesArgs(perses),
+						Args:           common.GetPersesArgs(perses, r.Config.TLSMinVersion, r.Config.TLSCipherSuites, r.Config.TLSConfigureOperands),
 						LivenessProbe:  livenessProbe,
 						ReadinessProbe: readinessProbe,
 					}},
@@ -202,8 +212,8 @@ func (r *PersesReconciler) createPersesDeployment(
 		dep.Spec.Template.Spec.Containers[0].Resources = *perses.Spec.Resources
 	}
 
-	if perses.Spec.ServiceAccountName != "" {
-		dep.Spec.Template.Spec.ServiceAccountName = perses.Spec.ServiceAccountName
+	if perses.Spec.ServiceAccountName != nil && *perses.Spec.ServiceAccountName != "" {
+		dep.Spec.Template.Spec.ServiceAccountName = *perses.Spec.ServiceAccountName
 	}
 
 	// Set the ownerRef for the Deployment

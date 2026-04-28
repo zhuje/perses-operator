@@ -1,18 +1,15 @@
-/*
-Copyright The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package metrics
 
@@ -34,14 +31,15 @@ var (
 
 // Metrics represents metrics associated with the operator.
 type Metrics struct {
-	// Reconciliation error counters
-	reconcileErrors *prometheus.CounterVec
+	// Reconciliation counters
+	reconcileOperations *prometheus.CounterVec
+	reconcileErrors     *prometheus.CounterVec
 
 	// Perses instance metrics
 	persesInstances *prometheus.GaugeVec
 
-	// Operator readiness
-	ready prometheus.Gauge
+	// Operator readiness per controller
+	ready *prometheus.GaugeVec
 
 	// mtx protects all fields below
 	mtx       sync.RWMutex
@@ -73,6 +71,13 @@ func (r resourceState) String() string {
 // NewMetrics initializes operator metrics and registers them with the controller-runtime registry.
 func NewMetrics() *Metrics {
 	m := &Metrics{
+		reconcileOperations: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "perses_operator_reconcile_operations_total",
+				Help: "Total number of reconciliation operations by controller",
+			},
+			[]string{"controller"},
+		),
 		reconcileErrors: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "perses_operator_reconcile_errors_total",
@@ -82,22 +87,24 @@ func NewMetrics() *Metrics {
 		),
 		persesInstances: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
-				Name: "perses_operator_perses_instances",
-				Help: "Number of Perses instances per namespace",
+				Name: "perses_operator_managed_perses_instances",
+				Help: "Number of Perses instances managed by the operator",
 			},
-			[]string{"namespace"},
+			[]string{"resource_namespace"},
 		),
-		ready: prometheus.NewGauge(
+		ready: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "perses_operator_ready",
 				Help: "Whether the operator is ready (1=yes, 0=no)",
 			},
+			[]string{"controller"},
 		),
 		resources: make(map[resourceKey]map[string]int),
 	}
 
 	// Register all metrics with controller-runtime metrics registry
 	metrics.Registry.MustRegister(
+		m.reconcileOperations,
 		m.reconcileErrors,
 		m.persesInstances,
 		m.ready,
@@ -107,6 +114,11 @@ func NewMetrics() *Metrics {
 	return m
 }
 
+// ReconcileOperations returns a counter to track total reconciliation operations.
+func (m *Metrics) ReconcileOperations(controller string) prometheus.Counter {
+	return m.reconcileOperations.With(prometheus.Labels{"controller": controller})
+}
+
 // ReconcileErrors returns a counter to track reconciliation errors.
 func (m *Metrics) ReconcileErrors(controller, reason string) prometheus.Counter {
 	return m.reconcileErrors.With(prometheus.Labels{"controller": controller, "reason": reason})
@@ -114,12 +126,12 @@ func (m *Metrics) ReconcileErrors(controller, reason string) prometheus.Counter 
 
 // PersesInstances returns a gauge to track Perses instance count.
 func (m *Metrics) PersesInstances(namespace string) prometheus.Gauge {
-	return m.persesInstances.With(prometheus.Labels{"namespace": namespace})
+	return m.persesInstances.With(prometheus.Labels{"resource_namespace": namespace})
 }
 
-// Ready returns a gauge to track operator readiness.
-func (m *Metrics) Ready() prometheus.Gauge {
-	return m.ready
+// Ready returns a gauge to track operator readiness for the given controller.
+func (m *Metrics) Ready(controller string) prometheus.Gauge {
+	return m.ready.With(prometheus.Labels{"controller": controller})
 }
 
 // SetSyncedResources sets the number of resources that synced successfully for the given object's key.

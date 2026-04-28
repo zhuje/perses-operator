@@ -1,18 +1,15 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package datasources
 
@@ -26,10 +23,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	persesv1alpha2 "github.com/perses/perses-operator/api/v1alpha2"
 	operatormetrics "github.com/perses/perses-operator/internal/metrics"
@@ -53,6 +54,7 @@ func datasourceFromContext(ctx context.Context) (*persesv1alpha2.PersesDatasourc
 // PersesDatasourceReconciler reconciles a PersesDatasource object
 type PersesDatasourceReconciler struct {
 	client.Client
+	APIReader             client.Reader // uncached reader for Secret data (cached client strips Data via Transform)
 	Scheme                *runtime.Scheme
 	Recorder              record.EventRecorder
 	ClientFactory         common.PersesClientFactory
@@ -69,6 +71,10 @@ var log = logger.WithField("module", "perses_datasource_controller")
 func (r *PersesDatasourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	start := time.Now()
 	objKey := req.String()
+
+	if r.Metrics != nil {
+		r.Metrics.ReconcileOperations("persesdatasource").Inc()
+	}
 
 	log.Infof("Reconciling PersesDatasource: %s/%s", req.Namespace, req.Name)
 
@@ -176,6 +182,9 @@ func (r *PersesDatasourceReconciler) setStatusToUnknown(ctx context.Context, req
 func (r *PersesDatasourceReconciler) setStatusToComplete(ctx context.Context, req ctrl.Request) (*ctrl.Result, error) {
 	return r.updateDatasourceStatus(ctx, req, func(datasource *persesv1alpha2.PersesDatasource) {
 		meta.SetStatusCondition(&datasource.Status.Conditions, metav1.Condition{
+			Type: common.TypeDegradedPerses, Status: metav1.ConditionFalse,
+			Reason: "Reconciled", Message: fmt.Sprintf("Datasource (%s) reconciled successfully", datasource.Name)})
+		meta.SetStatusCondition(&datasource.Status.Conditions, metav1.Condition{
 			Type: common.TypeAvailablePerses, Status: metav1.ConditionTrue,
 			Reason: "Reconciled", Message: fmt.Sprintf("Datasource (%s) created successfully", datasource.Name)})
 	})
@@ -188,10 +197,18 @@ func (r *PersesDatasourceReconciler) setStatusToDegraded(
 	degradedReason common.ConditionStatusReason,
 	degradedError error,
 ) (*ctrl.Result, error) {
+	msg := "unknown error"
+	if degradedError != nil {
+		msg = degradedError.Error()
+	}
+
 	result, err := r.updateDatasourceStatus(ctx, req, func(datasource *persesv1alpha2.PersesDatasource) {
 		meta.SetStatusCondition(&datasource.Status.Conditions, metav1.Condition{
+			Type: common.TypeAvailablePerses, Status: metav1.ConditionFalse,
+			Reason: string(degradedReason), Message: msg})
+		meta.SetStatusCondition(&datasource.Status.Conditions, metav1.Condition{
 			Type: common.TypeDegradedPerses, Status: metav1.ConditionTrue,
-			Reason: string(degradedReason), Message: degradedError.Error()})
+			Reason: string(degradedReason), Message: msg})
 	})
 
 	if err != nil {
@@ -201,8 +218,43 @@ func (r *PersesDatasourceReconciler) setStatusToDegraded(
 	return degradedResult, degradedError
 }
 
+// findDatasourcesForPerses returns reconcile requests for all PersesDatasources
+// across all namespaces when a Perses instance becomes available.
+// Each datasource's instanceSelector labels determine which Perses instances it syncs to.
+// If no instanceSelector is set, the datasource syncs to all Perses instances.
+func (r *PersesDatasourceReconciler) findDatasourcesForPerses(ctx context.Context, _ client.Object) []reconcile.Request {
+	datasources := &persesv1alpha2.PersesDatasourceList{}
+	if err := r.List(ctx, datasources); err != nil {
+		log.WithError(err).Error("Failed to list datasources for Perses instance change")
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(datasources.Items))
+	for i, d := range datasources.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      d.Name,
+				Namespace: d.Namespace,
+			},
+		}
+	}
+	return requests
+}
+
+// SetupWithManager sets up the controller with the Manager.
+// It watches PersesDatasource resources and also watches Perses instances
+// to trigger re-reconciliation of all datasources when a Perses instance becomes
+// available. Datasources are matched to Perses instances via instanceSelector labels.
+// Create and delete events for Perses instances are ignored because
+// the instance is not yet ready at creation, and deletion is handled by the datasource's
+// own reconciliation loop.
 func (r *PersesDatasourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&persesv1alpha2.PersesDatasource{}).
+		Watches(
+			&persesv1alpha2.Perses{},
+			handler.EnqueueRequestsFromMapFunc(r.findDatasourcesForPerses),
+			builder.WithPredicates(common.PersesAvailabilityPredicate()),
+		).
 		Complete(r)
 }

@@ -1,9 +1,21 @@
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package controllers
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -13,8 +25,10 @@ import (
 	persescommon "github.com/perses/perses/pkg/model/api/v1/common"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	persesv1alpha2 "github.com/perses/perses-operator/api/v1alpha2"
@@ -26,35 +40,30 @@ import (
 var _ = Describe("GlobalDatasource controller", Ordered, func() {
 	Context("GlobalDatasource controller test", func() {
 		const PersesName = "perses-for-globaldatasource"
-		const PersesNamespace = "perses-globaldatasource-test"
 		const GlobalDatasourceName = "my-custom-globaldatasource"
 		const PersesSecretName = GlobalDatasourceName + "-secret"
 
 		ctx := context.Background()
 
-		namespace := &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      PersesNamespace,
-				Namespace: PersesNamespace,
-			},
-		}
-
-		persesNamespaceName := types.NamespacedName{Name: PersesName, Namespace: PersesNamespace}
+		var namespace *corev1.Namespace
+		var PersesNamespace string
+		var persesNamespaceName types.NamespacedName
 		globaldatasourceNamespaceName := types.NamespacedName{Name: GlobalDatasourceName}
-
-		persesImage := "perses-dev.io/perses:test"
 
 		var newSecret *persesv1.GlobalSecret
 		var newGlobalDatasource *persesv1.GlobalDatasource
 
 		BeforeAll(func() {
 			By("Creating the Namespace to perform the tests")
+			namespace = &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "perses-globaldatasource-test-",
+				},
+			}
 			err := k8sClient.Create(ctx, namespace)
 			Expect(err).To(Not(HaveOccurred()))
-
-			By("Setting the Image ENV VAR which stores the Operand image")
-			err = os.Setenv("PERSES_IMAGE", persesImage)
-			Expect(err).To(Not(HaveOccurred()))
+			PersesNamespace = namespace.Name
+			persesNamespaceName = types.NamespacedName{Name: PersesName, Namespace: PersesNamespace}
 
 			By("Creating the custom resource for the Kind Perses")
 			perses := &persesv1alpha2.Perses{}
@@ -67,12 +76,30 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 						Namespace: PersesNamespace,
 					},
 					Spec: persesv1alpha2.PersesSpec{
-						ContainerPort: 8080,
+						ContainerPort: ptr.To(int32(8080)),
 					},
 				}
 
 				err = k8sClient.Create(ctx, perses)
 				Expect(err).To(Not(HaveOccurred()))
+
+				// Set the Perses instance status to Available so child controllers
+				// consider it ready for syncing.
+				// Use Eventually to handle potential resource version conflicts
+				Eventually(func() error {
+					// Fetch the latest version of the resource
+					if err := k8sClient.Get(ctx, persesNamespaceName, perses); err != nil {
+						return err
+					}
+					perses.Status.Conditions = []metav1.Condition{{
+						Type:               common.TypeAvailablePerses,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Testing",
+						Message:            "Available for testing",
+						LastTransitionTime: metav1.Now(),
+					}}
+					return k8sClient.Status().Update(ctx, perses)
+				}, time.Second*10, time.Millisecond*250).Should(Succeed())
 			}
 
 			newSecret = &persesv1.GlobalSecret{
@@ -104,9 +131,6 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 		AfterAll(func() {
 			By("Deleting the Namespace to perform the tests")
 			_ = k8sClient.Delete(ctx, namespace)
-
-			By("Removing the Image ENV VAR which stores the Operand image")
-			_ = os.Unsetenv("PERSES_IMAGE")
 		})
 
 		It("should successfully reconcile a custom resource globaldatasource for Perses", func() {
@@ -150,6 +174,7 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 			By("Reconciling the custom resource created")
 			globaldatasourceReconciler := &globaldatasourcecontroller.PersesGlobalDatasourceReconciler{
 				Client:        k8sClient,
+				APIReader:     k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				ClientFactory: common.NewWithClient(mockPersesClient),
 			}
@@ -172,21 +197,35 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 				return nil
 			}, time.Minute, time.Second).Should(Succeed())
 
-			By("Checking the latest Status Condition added to the Perses globaldatasource instance")
+			By("Checking the Status Conditions added to the Perses globaldatasource instance")
 			Eventually(func() error {
 				globaldatasourceWithStatus := &persesv1alpha2.PersesGlobalDatasource{}
 				err = k8sClient.Get(ctx, globaldatasourceNamespaceName, globaldatasourceWithStatus)
 
 				if len(globaldatasourceWithStatus.Status.Conditions) == 0 {
 					return fmt.Errorf("No status condition was added to the perses globaldatasource instance")
-				} else {
-					latestStatusCondition := globaldatasourceWithStatus.Status.Conditions[len(globaldatasourceWithStatus.Status.Conditions)-1]
-					expectedLatestStatusCondition := metav1.Condition{Type: common.TypeAvailablePerses,
-						Status: metav1.ConditionTrue, Reason: "Reconciled",
-						Message: fmt.Sprintf("GlobalDatasource (%s) created successfully", globaldatasourceWithStatus.Name)}
-					if latestStatusCondition.Message != expectedLatestStatusCondition.Message || latestStatusCondition.Reason != expectedLatestStatusCondition.Reason || latestStatusCondition.Status != expectedLatestStatusCondition.Status || latestStatusCondition.Type != expectedLatestStatusCondition.Type {
-						return fmt.Errorf("The latest status condition added to the perses globaldatasource instance is not as expected. Expected %v but recieved %v", expectedLatestStatusCondition, latestStatusCondition)
-					}
+				}
+
+				availableCond := apimeta.FindStatusCondition(globaldatasourceWithStatus.Status.Conditions, common.TypeAvailablePerses)
+				if availableCond == nil {
+					return fmt.Errorf("Available condition not found on the perses globaldatasource instance")
+				}
+				expectedAvailable := metav1.Condition{Type: common.TypeAvailablePerses,
+					Status: metav1.ConditionTrue, Reason: "Reconciled",
+					Message: fmt.Sprintf("GlobalDatasource (%s) created successfully", globaldatasourceWithStatus.Name)}
+				if availableCond.Message != expectedAvailable.Message || availableCond.Reason != expectedAvailable.Reason || availableCond.Status != expectedAvailable.Status || availableCond.Type != expectedAvailable.Type {
+					return fmt.Errorf("The Available status condition is not as expected. Expected %v but received %v", expectedAvailable, *availableCond)
+				}
+
+				degradedCond := apimeta.FindStatusCondition(globaldatasourceWithStatus.Status.Conditions, common.TypeDegradedPerses)
+				if degradedCond == nil {
+					return fmt.Errorf("Degraded condition not found on the perses globaldatasource instance")
+				}
+				expectedDegraded := metav1.Condition{Type: common.TypeDegradedPerses,
+					Status: metav1.ConditionFalse, Reason: "Reconciled",
+					Message: fmt.Sprintf("GlobalDatasource (%s) reconciled successfully", globaldatasourceWithStatus.Name)}
+				if degradedCond.Message != expectedDegraded.Message || degradedCond.Reason != expectedDegraded.Reason || degradedCond.Status != expectedDegraded.Status || degradedCond.Type != expectedDegraded.Type {
+					return fmt.Errorf("The Degraded status condition is not as expected. Expected %v but received %v", expectedDegraded, *degradedCond)
 				}
 
 				return err
@@ -259,6 +298,7 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 			By("Reconciling the custom resource created")
 			globaldatasourceReconciler := &globaldatasourcecontroller.PersesGlobalDatasourceReconciler{
 				Client:        k8sClient,
+				APIReader:     k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				ClientFactory: common.NewWithClient(mockPersesClient),
 			}
@@ -277,21 +317,35 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 				return nil
 			}, time.Minute, time.Second).Should(Succeed())
 
-			By("Checking the latest Status Condition added to the Perses globaldatasource instance")
+			By("Checking the Status Conditions added to the Perses globaldatasource instance")
 			Eventually(func() error {
 				globaldatasourceWithStatus := &persesv1alpha2.PersesGlobalDatasource{}
 				err = k8sClient.Get(ctx, globaldatasourceNamespaceName, globaldatasourceWithStatus)
 
 				if len(globaldatasourceWithStatus.Status.Conditions) == 0 {
 					return fmt.Errorf("No status condition was added to the perses globaldatasource instance")
-				} else {
-					latestStatusCondition := globaldatasourceWithStatus.Status.Conditions[len(globaldatasourceWithStatus.Status.Conditions)-1]
-					expectedLatestStatusCondition := metav1.Condition{Type: common.TypeDegradedPerses,
-						Status: metav1.ConditionTrue, Reason: string(common.ReasonBackendError),
-						Message: "something wrong happened with the request to the API.  Message: internal server error StatusCode: 500"}
-					if latestStatusCondition.Message != expectedLatestStatusCondition.Message || latestStatusCondition.Reason != expectedLatestStatusCondition.Reason || latestStatusCondition.Status != expectedLatestStatusCondition.Status || latestStatusCondition.Type != expectedLatestStatusCondition.Type {
-						return fmt.Errorf("The latest status condition added to the perses globaldatasource instance is not as expected. Expected %v but recieved %v", expectedLatestStatusCondition, latestStatusCondition)
-					}
+				}
+
+				degradedCond := apimeta.FindStatusCondition(globaldatasourceWithStatus.Status.Conditions, common.TypeDegradedPerses)
+				if degradedCond == nil {
+					return fmt.Errorf("Degraded condition not found on the perses globaldatasource instance")
+				}
+				expectedDegraded := metav1.Condition{Type: common.TypeDegradedPerses,
+					Status: metav1.ConditionTrue, Reason: string(common.ReasonBackendError),
+					Message: "something wrong happened with the request to the API.  Message: internal server error StatusCode: 500"}
+				if degradedCond.Message != expectedDegraded.Message || degradedCond.Reason != expectedDegraded.Reason || degradedCond.Status != expectedDegraded.Status || degradedCond.Type != expectedDegraded.Type {
+					return fmt.Errorf("The Degraded status condition is not as expected. Expected %v but received %v", expectedDegraded, *degradedCond)
+				}
+
+				availableCond := apimeta.FindStatusCondition(globaldatasourceWithStatus.Status.Conditions, common.TypeAvailablePerses)
+				if availableCond == nil {
+					return fmt.Errorf("Available condition not found on the perses globaldatasource instance")
+				}
+				expectedAvailable := metav1.Condition{Type: common.TypeAvailablePerses,
+					Status: metav1.ConditionFalse, Reason: string(common.ReasonBackendError),
+					Message: "something wrong happened with the request to the API.  Message: internal server error StatusCode: 500"}
+				if availableCond.Message != expectedAvailable.Message || availableCond.Reason != expectedAvailable.Reason || availableCond.Status != expectedAvailable.Status || availableCond.Type != expectedAvailable.Type {
+					return fmt.Errorf("The Available status condition is not as expected. Expected %v but received %v", expectedAvailable, *availableCond)
 				}
 
 				return err
@@ -321,6 +375,55 @@ var _ = Describe("GlobalDatasource controller", Ordered, func() {
 				}
 				return nil
 			}, time.Minute, time.Second).Should(Succeed())
+		})
+
+		It("should return an error when the Perses API delete call fails", func() {
+			By("Creating the custom resource for the Kind PersesGlobalDatasource")
+			globaldatasource := &persesv1alpha2.PersesGlobalDatasource{}
+			err := k8sClient.Get(ctx, globaldatasourceNamespaceName, globaldatasource)
+			if err != nil && errors.IsNotFound(err) {
+				globaldatasource = &persesv1alpha2.PersesGlobalDatasource{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: GlobalDatasourceName,
+					},
+					Spec: persesv1alpha2.DatasourceSpec{
+						Config: persesv1alpha2.Datasource{
+							DatasourceSpec: newGlobalDatasource.Spec,
+						},
+					},
+				}
+
+				err = k8sClient.Create(ctx, globaldatasource)
+				Expect(err).To(Not(HaveOccurred()))
+			}
+
+			mockPersesClient := new(internal.MockClient)
+			mockGlobalDatasource := new(internal.MockGlobalDatasource)
+
+			mockPersesClient.On("GlobalDatasource").Return(mockGlobalDatasource)
+			mockGlobalDatasource.On("Delete", GlobalDatasourceName).Return(perseshttp.RequestInternalError)
+
+			globaldatasourceReconciler := &globaldatasourcecontroller.PersesGlobalDatasourceReconciler{
+				Client:        k8sClient,
+				APIReader:     k8sClient,
+				Scheme:        k8sClient.Scheme(),
+				ClientFactory: common.NewWithClient(mockPersesClient),
+			}
+
+			globaldatasourceToDelete := &persesv1alpha2.PersesGlobalDatasource{}
+			err = k8sClient.Get(ctx, globaldatasourceNamespaceName, globaldatasourceToDelete)
+			Expect(err).To(Not(HaveOccurred()))
+
+			By("Deleting the custom resource")
+			err = k8sClient.Delete(ctx, globaldatasourceToDelete)
+			Expect(err).To(Not(HaveOccurred()))
+
+			By("Reconciling should return an error because the backend delete failed")
+			_, err = globaldatasourceReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: globaldatasourceNamespaceName,
+			})
+			Expect(err).To(HaveOccurred())
+			mockGlobalDatasource.AssertCalled(GinkgoT(), "Delete", GlobalDatasourceName)
 		})
 	})
 })

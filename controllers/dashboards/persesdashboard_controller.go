@@ -1,18 +1,15 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package dashboards
 
@@ -25,10 +22,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -54,6 +55,7 @@ func dashboardFromContext(ctx context.Context) (*persesv1alpha2.PersesDashboard,
 // PersesDashboardReconciler reconciles a PersesDashboard object
 type PersesDashboardReconciler struct {
 	client.Client
+	APIReader             client.Reader // uncached reader for Secret data (cached client strips Data via Transform)
 	Scheme                *runtime.Scheme
 	Recorder              record.EventRecorder
 	ClientFactory         common.PersesClientFactory
@@ -69,6 +71,10 @@ var log = logger.WithField("module", "perses_dashboards_controller")
 func (r *PersesDashboardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	start := time.Now()
 	objKey := req.String()
+
+	if r.Metrics != nil {
+		r.Metrics.ReconcileOperations("persesdashboard").Inc()
+	}
 
 	log.Infof("Reconciling PersesDashboard: %s/%s", req.Namespace, req.Name)
 
@@ -176,6 +182,9 @@ func (r *PersesDashboardReconciler) setStatusToUnknown(ctx context.Context, req 
 func (r *PersesDashboardReconciler) setStatusToComplete(ctx context.Context, req ctrl.Request) (*ctrl.Result, error) {
 	return r.updateDashboardStatus(ctx, req, func(dashboard *persesv1alpha2.PersesDashboard) {
 		meta.SetStatusCondition(&dashboard.Status.Conditions, metav1.Condition{
+			Type: common.TypeDegradedPerses, Status: metav1.ConditionFalse,
+			Reason: "Reconciled", Message: fmt.Sprintf("Dashboard (%s) reconciled successfully", dashboard.Name)})
+		meta.SetStatusCondition(&dashboard.Status.Conditions, metav1.Condition{
 			Type: common.TypeAvailablePerses, Status: metav1.ConditionTrue,
 			Reason: "Reconciled", Message: fmt.Sprintf("Dashboard (%s) created successfully", dashboard.Name)})
 	})
@@ -188,10 +197,18 @@ func (r *PersesDashboardReconciler) setStatusToDegraded(
 	degradedReason common.ConditionStatusReason,
 	degradedError error,
 ) (*ctrl.Result, error) {
+	msg := "unknown error"
+	if degradedError != nil {
+		msg = degradedError.Error()
+	}
+
 	result, err := r.updateDashboardStatus(ctx, req, func(dashboard *persesv1alpha2.PersesDashboard) {
 		meta.SetStatusCondition(&dashboard.Status.Conditions, metav1.Condition{
+			Type: common.TypeAvailablePerses, Status: metav1.ConditionFalse,
+			Reason: string(degradedReason), Message: msg})
+		meta.SetStatusCondition(&dashboard.Status.Conditions, metav1.Condition{
 			Type: common.TypeDegradedPerses, Status: metav1.ConditionTrue,
-			Reason: string(degradedReason), Message: degradedError.Error()})
+			Reason: string(degradedReason), Message: msg})
 	})
 
 	if err != nil {
@@ -201,8 +218,43 @@ func (r *PersesDashboardReconciler) setStatusToDegraded(
 	return degradedResult, degradedError
 }
 
+// findDashboardsForPerses returns reconcile requests for all PersesDashboards
+// across all namespaces when a Perses instance becomes available.
+// Each dashboard's instanceSelector labels determine which Perses instances it syncs to.
+// If no instanceSelector is set, the dashboard syncs to all Perses instances.
+func (r *PersesDashboardReconciler) findDashboardsForPerses(ctx context.Context, _ client.Object) []reconcile.Request {
+	dashboards := &persesv1alpha2.PersesDashboardList{}
+	if err := r.List(ctx, dashboards); err != nil {
+		log.WithError(err).Error("Failed to list dashboards for Perses instance change")
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(dashboards.Items))
+	for i, d := range dashboards.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      d.Name,
+				Namespace: d.Namespace,
+			},
+		}
+	}
+	return requests
+}
+
+// SetupWithManager sets up the controller with the Manager.
+// It watches PersesDashboard resources and also watches Perses instances
+// to trigger re-reconciliation of all dashboards when a Perses instance becomes
+// available. Dashboards are matched to Perses instances via instanceSelector labels.
+// Create and delete events for Perses instances are ignored because
+// the instance is not yet ready at creation, and deletion is handled by the dashboard's
+// own reconciliation loop.
 func (r *PersesDashboardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&persesv1alpha2.PersesDashboard{}).
+		Watches(
+			&persesv1alpha2.Perses{},
+			handler.EnqueueRequestsFromMapFunc(r.findDashboardsForPerses),
+			builder.WithPredicates(common.PersesAvailabilityPredicate()),
+		).
 		Complete(r)
 }

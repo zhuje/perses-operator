@@ -1,18 +1,15 @@
-/*
-Copyright 2023 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package common
 
@@ -23,6 +20,7 @@ import (
 	"github.com/perses/perses-operator/api/v1alpha2"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	. "github.com/onsi/ginkgo/v2"
 
@@ -33,6 +31,41 @@ func TestLabels(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Labels Suite")
 }
+
+var _ = Describe("ImageForPerses", func() {
+	DescribeTable("resolves the correct image",
+		func(specImage *string, flagImage string, expectedImage string, expectErr bool, errSubstring string) {
+			perses := &v1alpha2.Perses{
+				Spec: v1alpha2.PersesSpec{
+					Image: specImage,
+				},
+			}
+			image, err := ImageForPerses(perses, flagImage)
+			if expectErr {
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring(errSubstring))
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(image).To(Equal(expectedImage))
+			}
+		},
+		Entry("spec.image takes priority over flag",
+			ptr.To("custom/perses:v1.0.0"), "default/perses:v2.0.0",
+			"custom/perses:v1.0.0", false, ""),
+		Entry("falls back to flag when spec.image is nil",
+			nil, "default/perses:v2.0.0",
+			"default/perses:v2.0.0", false, ""),
+		Entry("falls back to flag when spec.image is empty",
+			ptr.To(""), "default/perses:v2.0.0",
+			"default/perses:v2.0.0", false, ""),
+		Entry("errors when neither spec.image nor flag is set",
+			nil, "",
+			"", true, "no image specified"),
+		Entry("errors when image has no tag",
+			ptr.To("perses/perses"), "",
+			"", true, "must include a tag"),
+	)
+})
 
 var _ = Describe("LabelsForPerses", func() {
 	DescribeTable("when creating labels for Perses components",
@@ -45,7 +78,7 @@ var _ = Describe("LabelsForPerses", func() {
 			strings.Repeat("a", 100),
 			&v1alpha2.Perses{
 				ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", 100)},
-				Spec:       v1alpha2.PersesSpec{Image: "perses/perses:latest"},
+				Spec:       v1alpha2.PersesSpec{Image: ptr.To("perses/perses:latest")},
 			},
 			func(labels map[string]string) {
 				nameLabel, exists := labels["app.kubernetes.io/name"]
@@ -62,7 +95,7 @@ var _ = Describe("LabelsForPerses", func() {
 					Name: "test-perses",
 				},
 				Spec: v1alpha2.PersesSpec{
-					Image: "perses/perses:latest",
+					Image: ptr.To("perses/perses:latest"),
 					Metadata: &v1alpha2.Metadata{
 						Labels: map[string]string{
 							"custom-label": "custom-value",

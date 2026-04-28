@@ -1,18 +1,15 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package v1alpha2
 
@@ -22,24 +19,30 @@ import (
 
 // PersesDatasourceStatus defines the observed state of PersesDatasource
 type PersesDatasourceStatus struct {
+	// conditions represent the latest observations of the PersesDatasource resource state
 	// +operator-sdk:csv:customresourcedefinitions:type=status
-	// Conditions represent the latest observations of the PersesDatasource resource state
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 }
 
 // DatasourceSpec defines the desired state of a Perses datasource
 type DatasourceSpec struct {
+	// config specifies the Perses datasource configuration
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// +kubebuilder:validation:Required
-	// Perses datasource configuration
+	// +required
+	//nolint:kubeapilinter // Datasource uses flexible JSON schema; struct-level required fields are not applicable
 	Config Datasource `json:"config"`
+	// client specifies authentication and TLS configuration for the datasource
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// +optional
-	// Client authentication and TLS configuration for the datasource
 	Client *Client `json:"client,omitempty"`
+	// instanceSelector selects Perses instances where this datasource will be created
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// +optional
-	// InstanceSelector selects Perses instances where this datasource will be created
 	InstanceSelector *metav1.LabelSelector `json:"instanceSelector,omitempty"`
 }
 
@@ -52,10 +55,17 @@ type DatasourceSpec struct {
 
 // PersesDatasource is the Schema for the PersesDatasources API
 type PersesDatasource struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
+	// metadata is the standard Kubernetes ObjectMeta
+	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   DatasourceSpec         `json:"spec,omitempty"`
+	// spec is the desired state of the PersesDatasource resource
+	// +required
+	Spec DatasourceSpec `json:"spec,omitzero"`
+	// status is the observed state of the PersesDatasource resource
+	// +optional
+	//nolint:kubeapilinter // non-pointer Status is the standard pattern for Kubernetes controllers
 	Status PersesDatasourceStatus `json:"status,omitempty"`
 }
 

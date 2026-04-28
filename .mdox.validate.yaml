@@ -1,0 +1,5 @@
+version: 1
+timeout: '1m'
+cache:
+  type: 'sqlite'
+  jitter: '1h'

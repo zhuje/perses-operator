@@ -1,24 +1,20 @@
-/*
-Copyright 2023 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package common
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/perses/perses-operator/api/v1alpha2"
@@ -74,27 +70,22 @@ func LabelsForPerses(name string, perses *v1alpha2.Perses) map[string]string {
 
 }
 
-// imageForPerses gets the Operand image which is managed by this controller
-// from the image field in the CR or PERSES_IMAGE environment variable defined in the config/manager/manager.yaml
+// ImageForPerses resolves the Perses server image in priority order:
+//  1. spec.image from the Perses CR (highest)
+//  2. --perses-default-base-image flag (persesImageFromFlags)
 func ImageForPerses(perses *v1alpha2.Perses, persesImageFromFlags string) (string, error) {
-	image := os.Getenv("PERSES_IMAGE")
-
-	if persesImageFromFlags != "" {
+	var image string
+	switch {
+	case perses.Spec.Image != nil && *perses.Spec.Image != "":
+		image = *perses.Spec.Image
+	case persesImageFromFlags != "":
 		image = persesImageFromFlags
+	default:
+		return "", fmt.Errorf("no image specified: set spec.image in the Perses CR or pass --perses-default-base-image")
 	}
 
-	if len(perses.Spec.Image) > 0 {
-		image = perses.Spec.Image
-	}
-
-	if image == "" {
-		return "", fmt.Errorf("perses image operand was not provided")
-	}
-
-	imageParts := strings.Split(image, ":")
-
-	if len(imageParts) < 2 {
-		return "", fmt.Errorf("image provided for perses %s does not have a tag version", image)
+	if !strings.Contains(image, ":") {
+		return "", fmt.Errorf("image %q must include a tag (e.g. :v1.0.0)", image)
 	}
 
 	return image, nil

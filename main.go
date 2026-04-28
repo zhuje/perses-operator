@@ -1,25 +1,25 @@
-/*
-Copyright 2025 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -28,21 +28,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	k8sapiflag "k8s.io/component-base/cli/flag"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	configv1 "github.com/openshift/api/config/v1"
 	persesv1alpha1 "github.com/perses/perses-operator/api/v1alpha1"
 	persesv1alpha2 "github.com/perses/perses-operator/api/v1alpha2"
 	dashboardcontroller "github.com/perses/perses-operator/controllers/dashboards"
 	datasourcecontroller "github.com/perses/perses-operator/controllers/datasources"
 	globaldatasourcecontroller "github.com/perses/perses-operator/controllers/globaldatasources"
 	persescontroller "github.com/perses/perses-operator/controllers/perses"
+	internalcache "github.com/perses/perses-operator/internal/cache"
 	operatormetrics "github.com/perses/perses-operator/internal/metrics"
+	internalopenshift "github.com/perses/perses-operator/internal/openshift"
+	"github.com/perses/perses-operator/internal/operator"
 	"github.com/perses/perses-operator/internal/perses/common"
+	operatortls "github.com/perses/perses-operator/internal/tls"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -69,6 +77,12 @@ func main() {
 	var persesServerURL string
 	var webhookPort int
 	var certDir string
+	var watchSecretLabelsFlag string
+	var watchAllSecrets bool
+	var tlsMinVersion string
+	var tlsCipherSuites string
+	var tlsClusterProfile bool
+	var tlsConfigureOperands bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8082", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -77,9 +91,21 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&persesImage, "perses-default-base-image", "docker.io/persesdev/perses:v0.51.0", "The default image used for the Perses Deployment or StatefulSet operands")
+	flag.StringVar(&persesImage, "perses-default-base-image", operator.DefaultPersesImage, "The default image used for the Perses Deployment or StatefulSet operands")
 	flag.StringVar(&persesServerURL, common.PersesServerURLFlag, "", "The Perses backend server URL")
 	flag.BoolVar(&enableHTTP2, "enable-http2", enableHTTP2, "If HTTP/2 should be enabled for the metrics and webhook servers.")
+	flag.StringVar(&watchSecretLabelsFlag, common.WatchSecretLabelsFlag, "", "Comma-separated key=value label pairs for filtering which secrets are watched. Default: perses.dev/watch=true")
+	flag.BoolVar(&watchAllSecrets, common.WatchAllSecretsFlag, false, "Watch all secrets regardless of labels (disables secret label filtering)")
+	flag.StringVar(&tlsMinVersion, common.TLSMinVersionFlag, "",
+		fmt.Sprintf("Minimum TLS version. Accepted values: %s. Overridden by --tls-cluster-profile.",
+			strings.Join(k8sapiflag.TLSPossibleVersions(), ", ")))
+	flag.StringVar(&tlsCipherSuites, common.TLSCipherSuitesFlag, "",
+		"Comma-separated TLS cipher suites. Overridden by --tls-cluster-profile.")
+	flag.BoolVar(&tlsClusterProfile, common.TLSClusterProfileFlag, false,
+		"Use TLS profile from the OpenShift APIServer resource, overriding --tls-min-version and --tls-cipher-suites. "+
+			"Watches for changes and restarts the operator. Requires an OpenShift cluster.")
+	flag.BoolVar(&tlsConfigureOperands, common.TLSConfigureOperandsFlag, false,
+		"Propagate TLS settings to managed Perses pods. Without this flag, TLS only applies to the operator itself.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -88,23 +114,91 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	disableHTTP2 := func(c *tls.Config) {
-		if enableHTTP2 {
-			return
-		}
-		c.NextProtos = []string{"http/1.1"}
+	secretSelector, err := internalcache.ParseSecretLabelSelector(watchSecretLabelsFlag)
+	if err != nil {
+		setupLog.Error(err, "invalid --watch-secret-labels value")
+		os.Exit(1)
 	}
+	if watchAllSecrets && watchSecretLabelsFlag != "" {
+		setupLog.Info("--watch-all-secrets is set, --watch-secret-labels will be ignored")
+	}
+	cacheByObject := internalcache.BuildCacheByObject(secretSelector, watchAllSecrets, tlsClusterProfile)
+
+	// Parse and validate TLS settings
+	parsedTLSMinVersion, err := operatortls.ParseTLSVersion(tlsMinVersion)
+	if err != nil {
+		setupLog.Error(err, "invalid --tls-min-version value", "value", tlsMinVersion)
+		os.Exit(1)
+	}
+	parsedCipherSuites, err := operatortls.ParseCipherSuites(tlsCipherSuites)
+	if err != nil {
+		setupLog.Error(err, "invalid --tls-cipher-suites value", "value", tlsCipherSuites)
+		os.Exit(1)
+	}
+
+	// When cluster profile detection is enabled, read TLS settings from the
+	// OpenShift APIServer resource, overriding any CLI flag values.
+	var initialProfileSpec configv1.TLSProfileSpec
+	if tlsClusterProfile {
+		if tlsMinVersion != "" || tlsCipherSuites != "" {
+			setupLog.Info("--tls-cluster-profile is set, --tls-min-version and --tls-cipher-suites will be overridden by the cluster profile")
+		}
+		utilruntime.Must(configv1.Install(scheme))
+
+		directClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "unable to create direct client for TLS profile bootstrap")
+			os.Exit(1)
+		}
+
+		profileMinVersion, profileCipherSuites, profileSpec, err := internalopenshift.FetchTLSProfile(context.Background(), directClient)
+		if err != nil {
+			setupLog.Error(err, "unable to fetch cluster TLS profile; --tls-cluster-profile requires an OpenShift cluster with a config.openshift.io/v1 APIServer resource")
+			os.Exit(1)
+		}
+
+		initialProfileSpec = profileSpec
+		tlsMinVersion = profileMinVersion
+		tlsCipherSuites = profileCipherSuites
+
+		parsedTLSMinVersion, err = operatortls.ParseTLSVersion(tlsMinVersion)
+		if err != nil {
+			setupLog.Error(err, "unable to parse cluster TLS min version", "value", tlsMinVersion)
+			os.Exit(1)
+		}
+		parsedCipherSuites, err = operatortls.ParseCipherSuites(tlsCipherSuites)
+		if err != nil {
+			setupLog.Error(err, "unable to parse cluster TLS cipher suites", "value", tlsCipherSuites)
+			os.Exit(1)
+		}
+
+		setupLog.Info("using cluster TLS profile", "minVersion", tlsMinVersion, "cipherSuites", tlsCipherSuites)
+	}
+
+	if !tlsClusterProfile && (tlsMinVersion != "" || tlsCipherSuites != "") {
+		setupLog.Info("using manual TLS settings", "minVersion", tlsMinVersion, "cipherSuites", tlsCipherSuites)
+	}
+	if tlsConfigureOperands && tlsMinVersion == "" && tlsCipherSuites == "" {
+		setupLog.Info("--tls-configure-operands is set but no TLS settings are configured; operand TLS args will not be added")
+	}
+
+	tlsConfigFunc := operatortls.ConfigureTLS(parsedTLSMinVersion, parsedCipherSuites, enableHTTP2)
+
+	// Create a cancellable context to support graceful restart on TLS profile changes
+	signalCtx := ctrl.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: server.Options{
 			BindAddress: metricsAddr,
-			TLSOpts:     []func(*tls.Config){disableHTTP2},
+			TLSOpts:     []func(*tls.Config){tlsConfigFunc},
 		},
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port:    webhookPort,
 			CertDir: certDir,
-			TLSOpts: []func(*tls.Config){disableHTTP2},
+			TLSOpts: []func(*tls.Config){tlsConfigFunc},
 		}),
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
@@ -121,10 +215,20 @@ func main() {
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
 		PprofBindAddress: "127.0.0.1:8083",
+		Cache: cache.Options{
+			ByObject: cacheByObject,
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if tlsClusterProfile {
+		if err := internalopenshift.SetupProfileWatcher(mgr, initialProfileSpec, cancel); err != nil {
+			setupLog.Error(err, "unable to setup TLS profile watcher")
+			os.Exit(1)
+		}
 	}
 
 	// Initialize operator metrics
@@ -134,11 +238,15 @@ func main() {
 
 	if err = (&persescontroller.PersesReconciler{
 		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		Metrics:               opMetrics,
 		ReconciliationTracker: reconciliationTracker,
 		Config: persescontroller.Config{
-			PersesImage: persesImage,
+			PersesImage:          persesImage,
+			TLSMinVersion:        tlsMinVersion,
+			TLSCipherSuites:      tlsCipherSuites,
+			TLSConfigureOperands: tlsConfigureOperands,
 		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Perses")
@@ -147,6 +255,7 @@ func main() {
 
 	if err = (&dashboardcontroller.PersesDashboardReconciler{
 		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		Metrics:               opMetrics,
 		ReconciliationTracker: reconciliationTracker,
@@ -158,6 +267,7 @@ func main() {
 
 	if err = (&datasourcecontroller.PersesDatasourceReconciler{
 		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		Metrics:               opMetrics,
 		ReconciliationTracker: reconciliationTracker,
@@ -169,6 +279,7 @@ func main() {
 
 	if err = (&globaldatasourcecontroller.PersesGlobalDatasourceReconciler{
 		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		Metrics:               opMetrics,
 		ReconciliationTracker: reconciliationTracker,
@@ -205,11 +316,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Mark operator as ready
-	opMetrics.Ready().Set(1)
+	// Mark all controllers as ready
+	opMetrics.Ready("perses").Set(1)
+	opMetrics.Ready("persesdashboard").Set(1)
+	opMetrics.Ready("persesdatasource").Set(1)
+	opMetrics.Ready("persesglobaldatasource").Set(1)
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

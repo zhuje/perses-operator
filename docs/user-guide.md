@@ -10,6 +10,8 @@ This documentation provides information on how to use the Perses Operator custom
   - [PersesDashboard](#persesdashboard)
 - [Examples](#examples)
 - [Project Management](#project-management)
+- [Tags](#tags)
+- [Cache and Watch Filtering](#cache-and-watch-filtering)
 - [Troubleshooting](#troubleshooting)
 
 ## Custom Resources
@@ -46,7 +48,7 @@ spec:
         privateKeyPath: tls.key
 
   # Optional container image to use as the Perses server operand
-  image: docker.io/perses/perses:v0.50.3
+  image: docker.io/persesdev/perses:v0.53.1
 
   # Optional service configuration
   service:
@@ -108,6 +110,16 @@ spec:
     timeoutSeconds: 5
     successThreshold: 1
     failureThreshold: 3
+
+  # Optional additional volumes and volumeMounts
+  volumes:
+    - name: extra-config
+      configMap:
+        name: my-perses-config
+  volumeMounts:
+    - name: extra-config
+      mountPath: /etc/perses/extra
+      readOnly: true
 ```
 
 ### PersesDatasource
@@ -247,6 +259,31 @@ The Perses operator maps Perses projects to Kubernetes namespaces. When you crea
 
 When reconciling Dashboards or Datasources the Perses operator synchronizes the namespace into a Perses project across all Perses servers in the cluster.
 
+## Tags
+
+You can assign tags to Perses resources (dashboards, datasources, global datasources) using the `perses.dev/tags` annotation on the Kubernetes custom resource. Tags are specified as a comma-separated string:
+
+```yaml
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: kubernetes-overview
+  namespace: monitoring
+  annotations:
+    perses.dev/tags: "oncall,high_severity,production"
+spec:
+  config:
+    display:
+      name: "Kubernetes Overview"
+    # ...
+```
+
+The operator parses the annotation, normalizes tags to lowercase, and populates the `tags` field on the corresponding Perses resource metadata when syncing to the Perses server. Tags can then be used for filtering and searching within the Perses UI. Duplicate tags (including duplicates resulting from case normalization) are automatically deduplicated.
+
+The same annotation works on `PersesDatasource` and `PersesGlobalDatasource` resources.
+
+Tag values must follow Perses tag validation rules: lowercase letters, numbers, spaces, hyphens, and underscores only, with a maximum of 50 characters per tag and 20 tags total.
+
 ## Secrets
 
 Perses secrets are exclusively managed by the Perses Operator with
@@ -264,9 +301,9 @@ The api for these types are the same
 but the keys ending in `Path` refer to a key within a secret or configmap
 when using those types.
 
-> [!WARNING]
-> The `file` type is not useful in the current state
-> as there is no way to mount files into the perses pod.
+> [!NOTE]
+> To use the `file` type, you must mount the file into the Perses pod
+> using `spec.volumes` and `spec.volumeMounts` on the `Perses` CR.
 
 ```yaml
 apiVersion: perses.dev/v1alpha1
@@ -328,7 +365,7 @@ metadata:
   name: perses
   namespace: monitoring
 spec:
-  image: docker.io/perses/perses:v0.50.3
+  image: docker.io/persesdev/perses:v0.53.1
   config:
     database:
       file:
@@ -435,6 +472,71 @@ spec:
                 label: 5m
         defaultValue: 1m
   duration: 1h
+```
+
+## Cache and Watch Filtering
+
+The operator uses label-based cache filtering to reduce memory usage in clusters with many resources. Only resources relevant to the operator are cached and watched.
+
+### Operator-managed resources
+
+Resources created by the operator (Deployments, StatefulSets, ConfigMaps, Services) are automatically filtered by the label `app.kubernetes.io/managed-by=perses-operator`, which is applied to all operator-created resources. No configuration is needed.
+
+### Secrets
+
+By default, the operator only watches secrets labeled with `perses.dev/watch=true`. You must add this label to any Kubernetes Secret that should trigger reconciliation when changed (e.g., provisioning secrets, TLS certificates, authentication credentials):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-perses-secret
+  labels:
+    perses.dev/watch: "true"
+```
+
+> [!NOTE]
+> The label controls which secret changes trigger reconciliation. The operator can still read any secret by name via the Kubernetes API when referenced in a CR spec.
+
+#### `--watch-secret-labels`
+
+Override the default secret label selector with a custom expression using standard [Kubernetes label selector syntax](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors):
+
+```sh
+# Watch secrets with a custom label
+--watch-secret-labels="my-operator.io/managed=true"
+
+# Multiple requirements (AND logic)
+--watch-secret-labels="team=platform,env=production"
+
+# Set-based selectors
+--watch-secret-labels="tier in (frontend,backend)"
+```
+
+#### `--watch-all-secrets`
+
+Disable label filtering for secrets entirely, restoring the behavior of watching all secrets in the cluster. When set, `--watch-secret-labels` is ignored.
+
+```sh
+--watch-all-secrets=true
+```
+
+### Migrating from previous versions
+
+Previous versions of the operator watched all secrets in the cluster. The operator now requires secrets to be labeled for watch-based change detection.
+
+After upgrading, add the `perses.dev/watch: "true"` label to all secrets referenced by your Perses custom resources:
+
+```sh
+kubectl label secret <secret-name> perses.dev/watch=true
+```
+
+Until the label is added, changes to those secrets will not trigger reconciliation. Existing resources will continue to function because the operator reads secret data directly from the API when needed.
+
+If you need time to label all secrets, you can temporarily restore the previous behavior:
+
+```sh
+--watch-all-secrets=true
 ```
 
 ## Troubleshooting

@@ -1,18 +1,15 @@
-/*
-Copyright 2023 The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package dashboards
 
@@ -27,6 +24,9 @@ import (
 	persesv1Common "github.com/perses/perses/pkg/model/api/v1/common"
 
 	logger "github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -38,9 +38,29 @@ import (
 var dlog = logger.WithField("module", "dashboard_controller")
 
 func (r *PersesDashboardReconciler) reconcileDashboardInAllInstances(ctx context.Context, req ctrl.Request) (*ctrl.Result, error) {
+	dashboard, ok := dashboardFromContext(ctx)
+	if !ok {
+		dlog.Error("dashboard not found in context")
+		res, err := subreconciler.RequeueWithError(fmt.Errorf("dashboard not found in context"))
+		return r.setStatusToDegraded(ctx, req, res, common.ReasonMissingResource, err)
+	}
+
+	var labelSelector labels.Selector
+	if dashboard.Spec.InstanceSelector == nil {
+		labelSelector = labels.Everything()
+	} else {
+		var err error
+		labelSelector, err = metav1.LabelSelectorAsSelector(dashboard.Spec.InstanceSelector)
+		if err != nil {
+			return subreconciler.RequeueWithError(err)
+		}
+	}
+
 	persesInstances := &persesv1alpha2.PersesList{}
-	var opts []client.ListOption
-	err := r.List(ctx, persesInstances, opts...)
+	opts := &client.ListOptions{
+		LabelSelector: labelSelector,
+	}
+	err := r.List(ctx, persesInstances, opts)
 	if err != nil {
 		dlog.WithError(err).Error("Failed to get perses instances")
 		res, err := subreconciler.RequeueWithError(err)
@@ -49,19 +69,14 @@ func (r *PersesDashboardReconciler) reconcileDashboardInAllInstances(ctx context
 
 	if len(persesInstances.Items) == 0 {
 		dlog.Info("No Perses instances found, retrying in 1 minute")
-		res, err := subreconciler.RequeueWithDelay(time.Minute)
-		return r.setStatusToDegraded(ctx, req, res, common.ReasonMissingPerses, err)
-
-	}
-
-	dashboard, ok := dashboardFromContext(ctx)
-	if !ok {
-		dlog.Error("dashboard not found in context")
-		res, err := subreconciler.RequeueWithError(fmt.Errorf("dashboard not found in context"))
-		return r.setStatusToDegraded(ctx, req, res, common.ReasonMissingResource, err)
+		return r.setStatusToDegraded(ctx, req, &ctrl.Result{RequeueAfter: time.Minute}, common.ReasonMissingPerses, fmt.Errorf("no Perses instances found matching the label selector"))
 	}
 
 	for _, persesInstance := range persesInstances.Items {
+		if !meta.IsStatusConditionTrue(persesInstance.Status.Conditions, common.TypeAvailablePerses) {
+			dlog.Infof("Skipping Perses instance %s/%s (not yet available)", persesInstance.Namespace, persesInstance.Name)
+			continue
+		}
 		if res, reason, err := r.syncPersesDashboard(ctx, persesInstance, dashboard); subreconciler.ShouldHaltOrRequeue(res, err) {
 			return r.setStatusToDegraded(ctx, req, res, reason, err)
 		}
@@ -71,7 +86,7 @@ func (r *PersesDashboardReconciler) reconcileDashboardInAllInstances(ctx context
 }
 
 func (r *PersesDashboardReconciler) syncPersesDashboard(ctx context.Context, perses persesv1alpha2.Perses, dashboard *persesv1alpha2.PersesDashboard) (*ctrl.Result, common.ConditionStatusReason, error) {
-	persesClient, err := r.ClientFactory.CreateClient(ctx, r.Client, perses)
+	persesClient, err := r.ClientFactory.CreateClient(ctx, r.APIReader, perses)
 
 	if err != nil {
 		dlog.WithError(err).Error("Failed to create perses rest client")
@@ -113,6 +128,7 @@ func (r *PersesDashboardReconciler) syncPersesDashboard(ctx context.Context, per
 		Metadata: persesv1.ProjectMetadata{
 			Metadata: persesv1.Metadata{
 				Name: dashboard.Name,
+				Tags: common.ParseTags(dashboard.Annotations),
 			},
 		},
 		Spec: dashboard.Spec.Config.DashboardSpec,
@@ -174,7 +190,7 @@ func (r *PersesDashboardReconciler) deleteDashboardInAllInstances(ctx context.Co
 }
 
 func (r *PersesDashboardReconciler) deleteDashboard(ctx context.Context, perses persesv1alpha2.Perses, dashboardNamespace string, dashboardName string) (*ctrl.Result, error) {
-	persesClient, err := r.ClientFactory.CreateClient(ctx, r.Client, perses)
+	persesClient, err := r.ClientFactory.CreateClient(ctx, r.APIReader, perses)
 
 	if err != nil {
 		dlog.WithError(err).Error("Failed to create perses rest client")
@@ -191,8 +207,15 @@ func (r *PersesDashboardReconciler) deleteDashboard(ctx context.Context, perses 
 
 	err = persesClient.Dashboard(dashboardNamespace).Delete(dashboardName)
 
-	if err != nil && errors.Is(err, perseshttp.RequestNotFoundError) {
-		dlog.Infof("Dashboard not found: %s", dashboardName)
+	// Ignore NotFound — the resource may have already been deleted from Perses directly.
+	// Any other error means the delete failed and should be retried.
+	if err != nil {
+		if errors.Is(err, perseshttp.RequestNotFoundError) {
+			dlog.Infof("Dashboard not found: %s", dashboardName)
+			return subreconciler.ContinueReconciling()
+		}
+		dlog.WithError(err).Errorf("Failed to delete dashboard: %s", dashboardName)
+		return subreconciler.RequeueWithError(err)
 	}
 
 	dlog.Infof("Dashboard deleted: %s", dashboardName)

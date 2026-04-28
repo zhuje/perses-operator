@@ -67,6 +67,10 @@ BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:v$(VERSION)
 # BUNDLE_GEN_FLAGS are the flags passed to the operator-sdk generate bundle command
 BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
 
+# VERSION_REPLACED defines the previous operator version for OLM replaces-mode upgrade chain.
+# Set this when generating bundles (e.g. make bundle VERSION_REPLACED=0.3.1)
+VERSION_REPLACED ?=
+
 # USE_IMAGE_DIGESTS defines if images are resolved via tags or digests
 # You can enable this value if you would like to use SHA Based Digests
 # To enable set flag to true
@@ -120,15 +124,34 @@ help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 
+.PHONY: format
+format: shfmt
+	@echo ">> formatting go code"
+	gofmt -w $$(find . -name '*.go' -print)
+	@echo ">> formatting shell scripts"
+	$(SHFMT) -l -w scripts/*.sh
+
 .PHONY: checkformat
-checkformat:
+checkformat: shfmt
 	@echo ">> checking go code format"
 	! gofmt -d $$(find . -name '*.go' -print) | grep '^'
+	@echo ">> checking shell script format"
+	$(SHFMT) -d scripts/*.sh
 
-.PHONY: checkunused
-checkunused:
+.PHONY: update-go-deps
+update-go-deps: ## Update all Go dependencies to latest versions
+	@echo ">> updating Go dependencies"
+	@for m in $$(go list -mod=readonly -m -f '{{ if and (not .Indirect) (not .Main)}}{{.Path}}{{end}}' all); do \
+		echo "Updating $$m"; \
+		go get -u $$m; \
+	done
+	@go mod tidy -v
+	@echo ">> Dependencies updated, run tests before committing."
+
+.PHONY: tidy
+tidy: ## Verify that go.mod and go.sum are tidy (for CI)
 	@echo ">> running check for unused/missing packages in go.mod"
-	go mod tidy
+	@go mod tidy
 	@git diff --exit-code -- go.sum go.mod
 
 ##@ Development
@@ -222,6 +245,11 @@ check-metrics-docs: generate-metrics-docs ## Verify that generated metrics docs 
 		git diff docs/metrics.md --exit-code; \
 	fi
 
+.PHONY: fmt-docs
+fmt-docs: mdox ## Format docs and validate links.
+	@echo ">> formatting markdown documents"
+	$(MDOX) fmt --soft-wraps -l $$(find . -name '*.md' -not -path './bin/*' -not -path './bundle/*' -not -path './.git/*' -not -path './docs/api.md' -not -path './docs/metrics.md' -print) --links.validate.config-file=./.mdox.validate.yaml
+
 .PHONY: fmt
 fmt: jsonnet-format ## Run go fmt against code.
 	go fmt ./...
@@ -230,18 +258,92 @@ fmt: jsonnet-format ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test
-test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)"  go test $(shell go list ./...) -v -coverprofile cover.out
+.PHONY: test-unit
+test-unit: fmt vet ## Run unit tests.
+	go test $(shell go list ./... | grep -v ./controllers) -v -coverprofile cover-unit.out
+
+.PHONY: test-integration
+test-integration: manifests generate fmt vet envtest ginkgo ## Run integration tests in parallel using envtest.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" $(GINKGO) --procs=4 -v --coverprofile=cover-integration.out --output-dir=. ./controllers/...
+
+.PHONY: test-alerts
+test-alerts: jsonnet-resources yq ## Run promtool unit tests for alerting rules (requires promtool).
+	@command -v promtool >/dev/null 2>&1 || { echo "promtool is required but not installed."; exit 1; }
+	@echo ">>>>> Testing alerting rules"
+	$(YQ) '.spec' jsonnet/examples/prometheusRule.yaml > test/promtool/rules.yaml
+	promtool test rules test/promtool/alerts_test.yaml; ret=$$?; rm -f test/promtool/rules.yaml; exit $$ret
 
 .PHONY: lint-jsonnet
 lint-jsonnet: $(JSONNETLINT_BINARY)
 	@echo ">>>>> Running linter"
 	echo ${JSONNET_SRC} | $(XARGS) -n 1 -- $(JSONNETLINT_BINARY)
 
+.PHONY: lint-golang
+lint-golang: golangci-lint ## Run Go linting.
+	$(GOLANGCI_LINT) run --timeout 5m
+
+.PHONY: lint-shell
+lint-shell: shellcheck ## Run shellcheck against shell scripts.
+	$(SHELLCHECK) -x scripts/*.sh
+
 .PHONY: lint
-lint: lint-jsonnet ## Run linting.
-	golangci-lint run
+lint: lint-jsonnet lint-golang lint-shell ## Run all linters.
+
+.PHONY: lint-api
+lint-api: golangci-lint-kube-api-linter ## Lint API types using kube-api-linter.
+	$(GOLANGCI_LINT_KAL) run -c .golangci-kube-api-linter.yml
+
+##@ E2E Testing
+
+KIND_CLUSTER_NAME ?= kuttl-e2e
+KIND_VERSION ?= $(shell grep kind-version .github/env | sed 's/kind-version=//')
+KIND_NODE_IMAGE ?= $(shell grep kind-image .github/env | sed 's/kind-image=//')
+E2E_TAG ?= $(shell git rev-parse --short HEAD)
+E2E_IMG ?= $(IMAGE_TAG_BASE):$(E2E_TAG)
+
+.PHONY: e2e-versions
+e2e-versions: ## Display versions used for e2e testing.
+	@echo "Kind version: $(KIND_VERSION)"
+	@echo "Kind node image: $(KIND_NODE_IMAGE)"
+	@echo "Go version: $(shell grep golang-version .github/env | sed 's/golang-version=//')"
+
+.PHONY: e2e-create-cluster
+e2e-create-cluster: ## Create a kind cluster for e2e tests.
+	@echo ">> Creating kind cluster with image $(KIND_NODE_IMAGE)..."
+	kind create cluster --name $(KIND_CLUSTER_NAME) --image $(KIND_NODE_IMAGE) --wait 5m 2>/dev/null || true
+
+.PHONY: e2e-deploy
+e2e-deploy: manifests generate kustomize check-container-runtime ## Build operator image, load into kind and deploy.
+	kubectl config use-context kind-$(KIND_CLUSTER_NAME)
+	@echo ">> Building operator image..."
+	$(CONTAINER_RUNTIME) build -f Dockerfile.dev -t $(E2E_IMG) .
+	@echo ">> Loading image into kind cluster..."
+ifeq ($(CONTAINER_RUNTIME),podman)
+	$(CONTAINER_RUNTIME) save -o /tmp/perses-operator-e2e.tar $(E2E_IMG)
+	kind load image-archive /tmp/perses-operator-e2e.tar --name $(KIND_CLUSTER_NAME)
+	rm -f /tmp/perses-operator-e2e.tar
+else
+	kind load docker-image $(E2E_IMG) --name $(KIND_CLUSTER_NAME)
+endif
+	@echo ">> Installing cert-manager..."
+	$(MAKE) install-cert-manager
+	@echo ">> Installing CRDs and deploying operator..."
+	$(KUSTOMIZE) build config/default | kubectl apply --server-side -f -
+	kubectl set image -n perses-operator-system deployment/perses-operator-controller-manager manager=$(E2E_IMG)
+	kubectl patch deployment perses-operator-controller-manager -n perses-operator-system \
+		-p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}'
+	kubectl wait --for=condition=Available --timeout=300s -n perses-operator-system deployment/perses-operator-controller-manager
+
+.PHONY: e2e-setup
+e2e-setup: e2e-create-cluster e2e-deploy ## Create kind cluster and deploy operator (local development).
+
+.PHONY: test-e2e
+test-e2e: kuttl ## Run e2e tests using kuttl (run e2e-setup first if cluster is not ready).
+	$(KUTTL) test --config test/e2e/kuttl-test.yaml
+
+.PHONY: e2e-cleanup
+e2e-cleanup: ## Delete the kind cluster used for e2e tests.
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
 
 ##@ Build
 
@@ -262,11 +364,11 @@ run: generate-local-certs manifests generate fmt vet ## Run a controller from yo
 # (i.e. docker build --platform linux/arm64 ). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: image-build
-image-build: check-container-runtime build test ## Build docker image with the manager.
+image-build: check-container-runtime build test-unit test-integration ## Build docker image with the manager.
 	${CONTAINER_RUNTIME} build -f Dockerfile -t ${IMG} .
 
 .PHONY: test-image-build
-test-image-build: check-container-runtime test ## Build a testing docker image with the manager.
+test-image-build: check-container-runtime test-unit test-integration ## Build a testing docker image with the manager.
 	${CONTAINER_RUNTIME} build -f Dockerfile.dev -t ${IMG} .
 
 .PHONY: image-push
@@ -281,7 +383,7 @@ image-push: ## Push docker image with the manager.
 # To properly provided solutions that supports more than one platform you should use this option.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
-docker-buildx: test ## Build and push docker image for the manager for cross-platform support
+docker-buildx: test-unit test-integration ## Build and push docker image for the manager for cross-platform support
 	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- docker buildx create --name project-v3-builder
@@ -291,7 +393,7 @@ docker-buildx: test ## Build and push docker image for the manager for cross-pla
 	rm Dockerfile.cross
 
 .PHONY: podman-cross-build
-podman-cross-build: test
+podman-cross-build: test-unit test-integration
 	podman manifest create -a ${IMG}
 	podman build --platform $(PLATFORMS) --manifest ${IMG} -f Dockerfile.dev
 	podman manifest push ${IMG}
@@ -302,6 +404,10 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	@echo ">> generating bundle.yaml (override image using IMG)"
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default > bundle.yaml
+
+.PHONY: installer-check
+installer-check: build-installer ## Verify bundle.yaml is up-to-date.
+	git diff --exit-code bundle.yaml
 
 ifndef ignore-not-found
   ignore-not-found = false
@@ -316,7 +422,7 @@ install-cert-manager: ## Install cert-manager into the K8s cluster specified in 
 
 .PHONY: install-crds
 install-crds: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+	$(KUSTOMIZE) build config/crd | kubectl apply --server-side -f -
 
 .PHONY: uninstall-cert-manager
 uninstall-cert-manager: ## Uninstall cert-manager from the K8s cluster specified in ~/.kube/config.
@@ -332,7 +438,7 @@ deploy: deploy-with-certmanager ## Deploy controller to the K8s cluster specifie
 .PHONY: deploy-with-certmanager
 deploy-with-certmanager: manifests kustomize install-cert-manager
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+	$(KUSTOMIZE) build config/default | kubectl apply --server-side -f -
 
 ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 ## This target generates the webhook certs locally and applies them to the cluster
@@ -343,7 +449,7 @@ deploy-local: generate-local-certs manifests kustomize
     	--dry-run=client -o yaml \
 		--cert="/tmp/k8s-webhook-server/serving-certs/tls.crt" \
 		--key="/tmp/k8s-webhook-server/serving-certs/tls.key" > "config/local/certificate.yaml"
-	$(KUSTOMIZE) build config/local | kubectl apply -f -
+	$(KUSTOMIZE) build config/local | kubectl apply --server-side -f -
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -352,15 +458,20 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 ##@ Build Dependencies
 
 .PHONY: bundle
-bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
-	$(OPERATOR_SDK) generate kustomize manifests -q
-	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
-	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
-	$(OPERATOR_SDK) bundle validate ./bundle
+bundle: manifests kustomize operator-sdk yq ## Generate bundle manifests and metadata, then validate generated files.
+	VERSION=$(VERSION) \
+	VERSION_REPLACED=$(VERSION_REPLACED) \
+	BUNDLE_GEN_FLAGS='$(BUNDLE_GEN_FLAGS)' \
+	IMG=$(IMG) \
+		scripts/bundle.sh
 
 .PHONY: bundle-check
 bundle-check: bundle
-	git diff --exit-code bundle config jsonnet/generated jsonnet/examples
+	git diff --exit-code bundle config
+
+.PHONY: jsonnet-check
+jsonnet-check: manifests
+	git diff --exit-code jsonnet/generated jsonnet/examples
 
 .PHONY: bundle-build
 bundle-build: generate bundle ## Build the bundle image.
@@ -422,3 +533,13 @@ generate-changelog:
 .PHONY: tag
 tag:
 	./scripts/release.sh --tag "${VERSION}"
+
+.PHONY: checklicense
+checklicense:
+	@echo ">> checking license"
+	$(GO) run ./scripts/check-license --check
+
+.PHONY: fixlicense
+fixlicense:
+	@echo ">> adding license header where it's missing"
+	$(GO) run ./scripts/check-license --fix

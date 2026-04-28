@@ -1,18 +1,15 @@
-/*
-Copyright The Perses Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright The Perses Authors
+// Licensed under the Apache License, Version 2.0 (the \"License\");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an \"AS IS\" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -70,22 +67,28 @@ func parseMetrics() []Metric {
 			Labels: []string{"resource", "state"},
 		},
 		{
+			Name:   "perses_operator_reconcile_operations_total",
+			Type:   "Counter",
+			Help:   "Total number of reconciliation operations by controller",
+			Labels: []string{"controller"},
+		},
+		{
 			Name:   "perses_operator_reconcile_errors_total",
 			Type:   "Counter",
 			Help:   "Total number of reconciliation errors by controller and reason",
 			Labels: []string{"controller", "reason"},
 		},
 		{
-			Name:   "perses_operator_perses_instances",
+			Name:   "perses_operator_managed_perses_instances",
 			Type:   "Gauge",
-			Help:   "Number of Perses instances per namespace",
-			Labels: []string{"namespace"},
+			Help:   "Number of Perses instances managed by the operator",
+			Labels: []string{"resource_namespace"},
 		},
 		{
 			Name:   "perses_operator_ready",
 			Type:   "Gauge",
 			Help:   "Whether the operator is ready (1=yes, 0=no)",
-			Labels: []string{},
+			Labels: []string{"controller"},
 		},
 	}
 
